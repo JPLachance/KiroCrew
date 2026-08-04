@@ -29,9 +29,10 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
+    from kiro_crew.dashboard.state import DashboardState
     from kiro_crew.session_map import SessionMap
 
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
@@ -57,6 +58,10 @@ from kiro_crew.cron import (
     compute_next_run_ts,
     format_schedule,
     get_local_tz,
+)
+from kiro_crew.dashboard.chat_utils import (
+    expire_slack_options,
+    remember_slack_options,
 )
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import ConversationLog, HistoryConsolidator
@@ -105,6 +110,7 @@ from kiro_crew.slack.format import (
     strip_thinking_tags,
     to_slack_mrkdwn,
 )
+from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.slack.sessions_view import (
     _SESSIONS_DEFAULT_LIMIT,
     _build_sessions_blocks,
@@ -2602,6 +2608,23 @@ async def handle_message(
     # ── Linked thread intercept: route to dashboard slot if linked ──
     if await maybe_route_linked_thread(text, session_key, user_id, channel, slack, reply_ts):
         return
+
+    # A new turn supersedes whatever question the previous one ended on, so any
+    # OPTIONS control still live in this thread stops being answerable. Runs
+    # after the linked-thread intercept because that path routes into _run_chat,
+    # which expires the control itself.
+    #
+    # Resolve the OWNING session first. The control is recorded under whichever
+    # session owns the thread, and for a dashboard-linked thread that is its
+    # ``dashboard:chat-N`` key, not the ``slack:<ts>`` key derived here — the
+    # same distinction the linked-thread lookup further down relies on. Expiring
+    # under the wrong key silently no-ops and leaves the control clickable.
+
+    await expire_slack_options(
+        cast("DashboardState | None", get_dashboard_state()),
+        sessions.get_session_for_thread(reply_ts) or session_key,
+    )
+
     logger.info(
         "🔍 handle_message: thread_ts=%s msg_ts=%s → session_key=%s channel=%s",
         thread_ts,
@@ -2996,6 +3019,15 @@ async def handle_message(
             session_key, agent=_agent, channel_id=channel
         )
         _acquired = True
+        # Expire AGAIN now the turn is serialized — see the same call in
+        # transport_dispatch. The pass earlier in this function runs before
+        # `get_or_create` waits its turn, so two messages arriving together both
+        # clear the OLD control and neither clears the NEW one the first turn
+        # posts on its way out, leaving live buttons for a superseded question.
+        await expire_slack_options(
+            cast("DashboardState | None", get_dashboard_state()),
+            sessions.get_session_for_thread(reply_ts) or session_key,
+        )
         if is_new:
             await sessions.set_channel(session_key, channel)
         if not linked_session_key:
@@ -3788,7 +3820,44 @@ async def handle_message(
         linked_session_key,
         _dashboard_state,
     )
-    await slack.post_blocks(channel, footer_blocks, footer_text, reply_ts)
+    _footer_ts = await slack.post_blocks(channel, footer_blocks, footer_text, reply_ts)
+    if options and _footer_ts:
+        # Remember this turn's OPTIONS control so the next turn can strike it
+        # through once the conversation has moved past the question it asked.
+        try:
+
+            remember_slack_options(
+                cast("DashboardState | None", get_dashboard_state()),
+                session_key,
+                PostedOptions(
+                    channel=channel,
+                    ts=_footer_ts,
+                    choices=tuple(options),
+                    blocks=tuple(footer_blocks),
+                    text=footer_text,
+                ),
+            )
+        except Exception:
+            logger.debug("Failed to record OPTIONS control", exc_info=True)
+
+        # The session permit was released well before this footer went up (the
+        # `finally` above), so a message that queued behind this turn can have
+        # acquired it and run ITS expiry pass already — over a record that did
+        # not exist yet. That leaves this control live for a question the
+        # conversation has moved past, which is the defect this PR exists to
+        # remove. If a turn is in flight now, we lost that race: spend the
+        # control ourselves rather than leaving it clickable.
+        if sessions.is_busy(session_key):
+            try:
+                await expire_slack_options(
+                    cast("DashboardState | None", get_dashboard_state()),
+                    sessions.get_session_for_thread(reply_ts) or session_key,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to expire OPTIONS control superseded mid-post",
+                    exc_info=True,
+                )
 
     # ── Voice reply (fire-and-forget, non-blocking) ──
     # Triggers when: (a) user has opted in globally or per-thread via !voice,

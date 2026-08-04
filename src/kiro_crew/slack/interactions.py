@@ -30,6 +30,7 @@ from kiro_crew.config.loader import (
     write_config_atomically,
 )
 from kiro_crew.cron import CronStoreBusy
+from kiro_crew.dashboard.chat_utils import forget_slack_options_for_thread
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.security import redact_and_truncate, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -47,6 +48,7 @@ from kiro_crew.slack.format import (
     OPTIONS_CHECKBOXES_ACTION,
     OPTIONS_SUBMIT_ACTION,
     build_options_selected_blocks,
+    replace_options_blocks,
 )
 from kiro_crew.slack.handler import (
     APPROVAL_INTERACTIVE,
@@ -1252,43 +1254,22 @@ def _mark_button_clicked(blocks: list[dict], clicked_action_id: str, label: str)
 _ACTION_PREFIX = "action::"
 
 
-def _replace_options_blocks(blocks: list[dict], selected_blocks: list[dict]) -> list[dict]:
-    """Replace OPTIONS actions block(s) with *selected_blocks* in place.
+def _forget_options_control(thread_ts: str, ts: str | None = None) -> None:
+    """Drop the recorded OPTIONS control for *thread_ts*'s conversation.
 
-    Walks *blocks* looking for any ``actions`` block whose elements include
-    ``OPTIONS_CHECKBOXES_ACTION``, ``OPTIONS_SUBMIT_ACTION``, or an action_id
-    starting with ``OPTIONS_ACTION_PREFIX``. The first such block is replaced
-    by *selected_blocks* (inserted in order); subsequent OPTIONS actions blocks
-    are dropped. All other blocks are preserved unchanged.
+    A click has just re-rendered the message with the user's selection, so the
+    turn-start expiry must not run over it afterwards — striking every choice
+    through would erase the choice they made. A thread can be owned either by a
+    Slack-born session or by a dashboard session mirroring into it, so this
+    clears every key that one conversation can be recorded under.
     """
-    result: list[dict] = []
-    inserted = False
-    for block in blocks:
-        if block.get("type") != "actions":
-            result.append(block)
-            continue
-        elements = block.get("elements", [])
-        is_options_block = any(
-            el.get("action_id") in (OPTIONS_CHECKBOXES_ACTION, OPTIONS_SUBMIT_ACTION)
-            or el.get("action_id", "").startswith(OPTIONS_ACTION_PREFIX)
-            for el in elements
-        )
-        if not is_options_block:
-            result.append(block)
-            continue
-        if not inserted:
-            result.extend(selected_blocks)
-            inserted = True
-        # Drop the OPTIONS actions block itself
-    if not inserted:
-        # No OPTIONS actions block found — append selected_blocks at end so
-        # the user still sees their selection (defensive fallback).
-        logger.warning(
-            "OPTIONS actions block not found in parent message blocks; "
-            "appending selection at end"
-        )
-        result.extend(selected_blocks)
-    return result
+    if not _orch or not thread_ts:
+        return
+    try:
+
+        forget_slack_options_for_thread(_orch.dashboard_state, thread_ts, ts)
+    except Exception:
+        logger.debug("Failed to clear recorded OPTIONS control", exc_info=True)
 
 
 def _extract_selected_value(action: dict) -> tuple[str, str]:
@@ -1500,9 +1481,13 @@ async def _handle_options_submit(payload: dict, channel: str, msg_ts: str) -> No
     # to post-and-delete if update_message raises (resilience).
     selected_blocks = build_options_selected_blocks(all_choices, selected_indices)
     parent_blocks = payload.get("message", {}).get("blocks", [])
-    new_blocks = _replace_options_blocks(parent_blocks, selected_blocks)
+    new_blocks = replace_options_blocks(parent_blocks, selected_blocks)
     new_ts = msg_ts
     edited = False
+    # Set when the original message survives our attempt to remove it: the
+    # control is then STILL on screen and still clickable, so its record has to
+    # outlive this submit for a later turn to expire it.
+    original_still_live = False
     try:
         await _orch.slack.update_message(channel, msg_ts, text=combined, blocks=new_blocks)
         edited = True
@@ -1530,12 +1515,21 @@ async def _handle_options_submit(payload: dict, channel: str, msg_ts: str) -> No
         try:
             await _orch.slack.delete_message(channel, msg_ts)
         except Exception:
+            original_still_live = True
             logger.warning(
                 "Failed to delete original OPTIONS message after fallback "
                 "post_blocks succeeded; user may see both the original "
                 "and the new selection message",
                 exc_info=True,
             )
+
+    # The control is spent only once the original is actually gone — either
+    # rewritten in place, or posted-and-deleted. When the delete failed those
+    # buttons are still sitting in the channel, so the record has to stay:
+    # dropping it is exactly what leaves a permanently clickable control, the
+    # defect this PR exists to remove.
+    if not original_still_live:
+        _forget_options_control(thread_ts, msg_ts)
 
     action_context = (
         "--- CONTEXT ENTRY BEGIN ---\n"
@@ -1676,9 +1670,12 @@ async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str
     # selection, preserving every other surrounding block. Falls back to
     # post-and-delete if update_message raises.
     selected_blocks = build_options_selected_blocks(all_choices, selected_index)
-    new_blocks = _replace_options_blocks(blocks, selected_blocks)
+    new_blocks = replace_options_blocks(blocks, selected_blocks)
     new_ts = msg_ts
     edited = False
+    # See the multi-select submit path: set when the original message outlives
+    # our attempt to remove it, so its still-clickable control keeps a record.
+    original_still_live = False
     try:
         await _orch.slack.update_message(channel, msg_ts, text=choice, blocks=new_blocks)
         edited = True
@@ -1706,12 +1703,19 @@ async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str
         try:
             await _orch.slack.delete_message(channel, msg_ts)
         except Exception:
+            original_still_live = True
             logger.warning(
                 "Failed to delete original OPTIONS message after fallback "
                 "post_blocks succeeded; user may see both the original "
                 "and the new selection message",
                 exc_info=True,
             )
+
+    # Same rule as the multi-select submit path: only forget the control once
+    # the original message is genuinely gone. A failed delete leaves the buttons
+    # live, and a forgotten record can never be expired.
+    if not original_still_live:
+        _forget_options_control(thread_ts, msg_ts)
 
     t = asyncio.create_task(
         handle_message(

@@ -438,6 +438,18 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "exfiltration-URL scanners plus a sensitive-header pass before anything is "
         "written into the archive.",
     ),
+    (
+        "Slack message + OPTIONS control egress",
+        "slack/outbound.py",
+        "Every agent-authored text this module sends to Slack: plain messages, the "
+        "fallback text of a Block Kit post, and the choice labels and button "
+        "`value` payloads of an OPTIONS control. Slack is an output boundary "
+        "shared with everyone in the channel, so both scanners run here — and "
+        "they run over the WHOLE text at full length BEFORE it is split or "
+        "truncated, because redacting after a length cut can leave the tail of a "
+        "credential intact in the next chunk, and a button value is capped "
+        "separately from the label it belongs to.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do

@@ -20,8 +20,12 @@ import asyncio
 import logging
 import re
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+from kiro_crew.dashboard.chat_utils import (
+    expire_slack_options,
+    remember_slack_options,
+)
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY
 from kiro_crew.llm_helpers import save_conversation_turn
@@ -50,6 +54,7 @@ from kiro_crew.stats import Stats
 if TYPE_CHECKING:
     from kiro_crew.context import ContextBuilder
     from kiro_crew.cron import CronService
+    from kiro_crew.dashboard.state import DashboardState
     from kiro_crew.history import ConversationLog, HistoryConsolidator
     from kiro_crew.providers.base import LLMProvider
     from kiro_crew.session import SessionManager
@@ -220,6 +225,15 @@ async def handle_message_transport(
     if await maybe_route_linked_thread(text, session_key, user_id, channel, slack, reply_ts):
         return
 
+    # A new turn supersedes whatever question the previous one ended on, so any
+    # OPTIONS control still live in this thread stops being answerable. Runs
+    # after the linked-thread intercept because that path routes into _run_chat,
+    # which expires the control itself.
+
+    await expire_slack_options(
+        cast("DashboardState | None", get_dashboard_state()), session_key
+    )
+
     # ── Hook: auto-reply before touching the LLM (mirrors native) ──
     # A HOOK_REPLY from the context builder's hooks short-circuits the turn: post
     # the canned reply, log it, and return WITHOUT spawning an LLM session — same
@@ -365,6 +379,18 @@ async def handle_message_transport(
             session_key, agent=_agent, channel_id=channel
         )
         _acquired = True
+        # Expire AGAIN, now that the turn is serialized. The pass at the top of
+        # this function runs before `get_or_create` waits its turn, so two
+        # messages arriving together both clear the control while it is still the
+        # OLD one — then the first turn ends by posting a NEW control, which the
+        # second turn never expires because its only pass already happened. The
+        # user is left with live buttons from a question the conversation has
+        # already moved past, which is the exact defect this path exists to
+        # prevent. Same staleness reasoning as the FRESH thread read below.
+        await expire_slack_options(
+            cast("DashboardState | None", get_dashboard_state()),
+            sessions.get_session_for_thread(reply_ts) or session_key,
+        )
         if is_new:
             await sessions.set_channel(session_key, channel)
         if not linked_session_key and not sessions.get_session_for_thread(reply_ts):
@@ -507,6 +533,22 @@ async def handle_message_transport(
         # to the outer except and double-record the turn as a failure.
         sessions.record_success(session_key)
         Stats().inc_message_success()
+
+        # Remember this turn's OPTIONS control, if it posted one, so the next
+        # turn on this thread can strike it through.
+        try:
+
+            remember_slack_options(
+                cast("DashboardState | None", get_dashboard_state()),
+                session_key,
+                renderer.posted_options,
+            )
+        except Exception:
+            logger.debug(
+                "transport_dispatch: failed to record OPTIONS control session=%s",
+                session_key,
+                exc_info=True,
+            )
 
         try:
             sessions.check_context_usage(session_key, client)
