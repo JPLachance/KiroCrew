@@ -4303,7 +4303,8 @@
       "model_list": "模型列表",
       "models": "模型",
       "reasoning": "推理",
-      "set_default_for_agent": "设为 {{agent}} 的默认模型",
+      "set_default_for_agent": "将 {{model}} 设为 {{agent}} 的默认模型",
+      "pin_model_unavailable": "{{model}} 目前未提供",
       "set_default_for_new_sessions": "新会话的全局后备…",
       "type_to_filter": "输入以筛选…"
     },
@@ -8268,7 +8269,6 @@
         "copied": "已复制",
         "update_check_managed_by_app": "此版本通过应用自身更新，不经由网关。",
         "update_check_managed_by_image": "此容器通过拉取更新的镜像来升级。",
-        "update_to_version": "更新到 v{{version}}",
         "not_checked_yet": "尚未检查",
         "notify_when_an_update_is_available": "有可用更新时通知我",
         "auto_update_notify_only_on_this_install": "此安装方式无法自行应用更新，因此仅作通知。"

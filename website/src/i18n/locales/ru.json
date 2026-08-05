@@ -4468,7 +4468,8 @@
       "models": "Модели",
       "reasoning": "Рассуждения",
       "default_for_agent": "По умолчанию для {{agent}}",
-      "set_default_for_agent": "Назначить по умолчанию для {{agent}}",
+      "set_default_for_agent": "Использовать {{model}} по умолчанию для {{agent}}",
+      "pin_model_unavailable": "{{model}} сейчас не предлагается",
       "set_default_for_new_sessions": "Глобальный запасной вариант для новых сессий…",
       "type_to_filter": "Введите для фильтрации…"
     },
@@ -8529,7 +8530,6 @@
         "copied": "Скопировано",
         "update_check_managed_by_app": "Эта сборка обновляется через приложение, а не через шлюз.",
         "update_check_managed_by_image": "Этот контейнер обновляется загрузкой более нового образа.",
-        "update_to_version": "Обновить до v{{version}}",
         "not_checked_yet": "Ещё не проверялось",
         "notify_when_an_update_is_available": "Уведомлять о доступном обновлении",
         "auto_update_notify_only_on_this_install": "Эта установка не может применять обновления сама и только уведомляет."

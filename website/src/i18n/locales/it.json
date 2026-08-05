@@ -4413,7 +4413,8 @@
       "model_list": "Elenco dei modelli",
       "models": "Modelli",
       "reasoning": "Ragionamento",
-      "set_default_for_agent": "Imposta come predefinito per {{agent}}",
+      "set_default_for_agent": "Imposta {{model}} come predefinito per {{agent}}",
+      "pin_model_unavailable": "{{model}} non è offerto al momento",
       "set_default_for_new_sessions": "Fallback globale per le nuove sessioni…",
       "type_to_filter": "Digita per filtrare…"
     },
@@ -8442,7 +8443,6 @@
         "copied": "Copiato",
         "update_check_managed_by_app": "Questa build si aggiorna tramite l'app, non tramite il gateway.",
         "update_check_managed_by_image": "Questo container si aggiorna scaricando un'immagine più recente.",
-        "update_to_version": "Aggiorna alla v{{version}}",
         "not_checked_yet": "Non ancora controllato",
         "notify_when_an_update_is_available": "Avvisami quando è disponibile un aggiornamento",
         "auto_update_notify_only_on_this_install": "Questa installazione non può applicare gli aggiornamenti da sola, quindi si limita ad avvisare."

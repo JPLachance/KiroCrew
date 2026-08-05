@@ -4358,7 +4358,8 @@
       "model_list": "মডেল তালিকা",
       "models": "মডেল",
       "reasoning": "রিজনিং",
-      "set_default_for_agent": "{{agent}}-এর জন্য ডিফল্ট হিসেবে সেট করো",
+      "set_default_for_agent": "{{agent}}-এর জন্য {{model}} ডিফল্ট করুন",
+      "pin_model_unavailable": "{{model}} এই মুহূর্তে অফার করা হচ্ছে না",
       "set_default_for_new_sessions": "নতুন সেশনের জন্য গ্লোবাল ফলব্যাক…",
       "type_to_filter": "ফিল্টার করতে টাইপ করুন…"
     },
@@ -8320,7 +8321,7 @@
         "update_error_server": "আপডেট সার্ভার একটি ত্রুটি ফেরত দিয়েছে।",
         "update_error_server_status": "আপডেট সার্ভার একটি ত্রুটি ফেরত দিয়েছে (HTTP {{status}})।",
         "update_error_unknown": "কিছু একটা ভুল হয়েছে। আবার আপডেট খুঁজে দেখুন।",
-        "update_to_version": "v{{version}}-এ আপডেট করো",
+        "update_to_version": "v{{version}}-এ আপডেট করুন",
         "updates": "আপডেট",
         "updating": "আপডেট হচ্ছে…",
         "updating_gateway_restarting": "আপডেট হচ্ছে — গেটওয়ে রিস্টার্ট হচ্ছে…",
@@ -8355,7 +8356,6 @@
         "copied": "কপি করা হয়েছে",
         "update_check_managed_by_app": "এই বিল্ডটি অ্যাপের মাধ্যমে আপডেট হয়, গেটওয়ের মাধ্যমে নয়।",
         "update_check_managed_by_image": "এই কনটেইনারটি নতুন ইমেজ টেনে আপডেট হয়।",
-        "update_to_version": "v{{version}}-এ আপডেট করুন",
         "not_checked_yet": "এখনও পরীক্ষা করা হয়নি",
         "notify_when_an_update_is_available": "আপডেট পাওয়া গেলে জানাও",
         "auto_update_notify_only_on_this_install": "এই ইনস্টলটি নিজে আপডেট প্রয়োগ করতে পারে না, তাই শুধু জানায়।"

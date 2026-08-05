@@ -4358,7 +4358,8 @@
       "model_list": "मॉडल सूची",
       "models": "मॉडल",
       "reasoning": "रीज़निंग",
-      "set_default_for_agent": "{{agent}} के लिए डिफ़ॉल्ट बनाओ",
+      "set_default_for_agent": "{{agent}} के लिए {{model}} को डिफ़ॉल्ट बनाएँ",
+      "pin_model_unavailable": "{{model}} अभी पेश नहीं किया जा रहा है",
       "set_default_for_new_sessions": "नए सेशन के लिए ग्लोबल फ़ॉलबैक…",
       "type_to_filter": "फ़िल्टर करने के लिए टाइप करें…"
     },
@@ -8320,7 +8321,7 @@
         "update_error_server": "अपडेट सर्वर ने त्रुटि लौटाई।",
         "update_error_server_status": "अपडेट सर्वर ने त्रुटि लौटाई (HTTP {{status}})।",
         "update_error_unknown": "कुछ गड़बड़ हो गई। अपडेट दोबारा जाँचकर देखें।",
-        "update_to_version": "v{{version}} पर अपडेट करो",
+        "update_to_version": "v{{version}} पर अपडेट करें",
         "updates": "अपडेट",
         "updating": "अपडेट हो रहा है…",
         "updating_gateway_restarting": "अपडेट हो रहा है — गेटवे पुनः आरंभ हो रहा है…",
@@ -8355,7 +8356,6 @@
         "copied": "कॉपी किया गया",
         "update_check_managed_by_app": "यह बिल्ड ऐप के ज़रिए अपडेट होता है, गेटवे के ज़रिए नहीं।",
         "update_check_managed_by_image": "यह कंटेनर नई इमेज खींचकर अपडेट होता है।",
-        "update_to_version": "v{{version}} पर अपडेट करें",
         "not_checked_yet": "अभी जाँचा नहीं गया",
         "notify_when_an_update_is_available": "अपडेट उपलब्ध होने पर सूचित करें",
         "auto_update_notify_only_on_this_install": "यह इंस्टॉल स्वयं अपडेट लागू नहीं कर सकता, इसलिए यह केवल सूचित करता है।"

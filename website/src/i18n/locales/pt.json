@@ -4413,7 +4413,8 @@
       "model_list": "Lista de modelos",
       "models": "Modelos",
       "reasoning": "Raciocínio",
-      "set_default_for_agent": "Definir como padrão de {{agent}}",
+      "set_default_for_agent": "Definir {{model}} como padrão para {{agent}}",
+      "pin_model_unavailable": "{{model}} não está sendo oferecido no momento",
       "set_default_for_new_sessions": "Reserva global para novas sessões…",
       "type_to_filter": "Digite para filtrar…"
     },
@@ -8442,7 +8443,6 @@
         "copied": "Copiado",
         "update_check_managed_by_app": "Esta versão é atualizada pelo próprio aplicativo, não pelo gateway.",
         "update_check_managed_by_image": "Este contêiner é atualizado baixando uma imagem mais recente.",
-        "update_to_version": "Atualizar para a v{{version}}",
         "not_checked_yet": "Ainda não verificado",
         "notify_when_an_update_is_available": "Avisar quando houver uma atualização disponível",
         "auto_update_notify_only_on_this_install": "Esta instalação não pode aplicar atualizações sozinha, apenas avisa."
