@@ -20,6 +20,78 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ── Path-based change detection (issue #1556) ────────────────────────
+  # A' shape: BACKEND jobs always run. The backend pytest suite is a
+  # repo-wide guard/contract suite -- it asserts on website/, skills/,
+  # packages/, docker/, install scripts and root fixtures -- so a backend
+  # path-allowlist is inherently leaky and was dropped. Only the
+  # FRONTEND-surface jobs (frontend-lint, frontend-test, electron-test) are
+  # gated on run_frontend: they hold no backend guard, so skipping them on a
+  # backend-only or docs-only change is safe. A follow-up will add a
+  # dedicated always-on "cross-surface" job so the backend suite can also be
+  # gated (frontend-only PRs skipping backend) without losing those guards.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # dorny/paths-filter reads the PR's changed-file list from the GitHub
+    # REST API on pull_request events -> needs pull-requests:read. Job-level
+    # permissions REPLACE the top-level grant, so contents:read is restated
+    # (checkout + git-based detection on push).
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run_frontend: ${{ steps.decide.outputs.run_frontend }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'website/**'
+              # Cross-surface guards that RUN in the frontend jobs but read
+              # these backend-side inputs, so a change to them must trigger
+              # frontend-lint/frontend-test or the guard is silently skipped:
+              #   website/scripts/check-app-manifest-sync.mjs + appManifest.test.ts
+              #     read src/kiro_crew/apps/builtins (i18n App Store manifest sync)
+              #   featureRequestLabels.test.ts reads skills/feature-request/SKILL.md
+              #   themeCssCorpus.test.tsx reads test/fixtures/theme_css_corpus.json
+              #   src/pages/connections/registry.ts statically imports
+              #     src/kiro_crew/connections/registry.json (#1229/#1287) -- it is
+              #     PRODUCTION code, so tsc -b + vitest bundle it and
+              #     check-i18n-render.mjs special-cases the resolve.
+              # (Kept narrow on purpose; the follow-up cross-surface job will
+              # generalize this so the enumeration isn't load-bearing.)
+              - 'src/kiro_crew/apps/builtins/**'
+              - 'src/kiro_crew/connections/registry.json'
+              - 'skills/feature-request/SKILL.md'
+              - 'test/fixtures/theme_css_corpus.json'
+            meta:
+              - '.github/**'
+              - 'scripts/**'
+
+      - name: Decide which surfaces run
+        id: decide
+        env:
+          FRONTEND: ${{ steps.filter.outputs.frontend }}
+          META: ${{ steps.filter.outputs.meta }}
+          # Escape hatch: the ci-full-run label forces the frontend jobs on.
+          # NOTE: this workflow does not listen for the `labeled` event
+          # (that would re-run on every bot label), so the label takes effect
+          # on the NEXT push to the PR, not the instant it is applied.
+          FULL_RUN: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full-run') }}
+        run: |
+          # Frontend-surface jobs run when website/ changed, when meta paths
+          # changed (.github/**, scripts/** -- when in doubt run everything),
+          # or when a full run is forced. Backend jobs are ungated (always on).
+          run_frontend=false
+          if [ "$FRONTEND" = "true" ] || [ "$META" = "true" ] || [ "$FULL_RUN" = "true" ]; then run_frontend=true; fi
+          echo "run_frontend=$run_frontend" >> "$GITHUB_OUTPUT"
+          echo "frontend=$FRONTEND meta=$META full_run=$FULL_RUN -> run_frontend=$run_frontend"
+
   scrub-lint:
     name: De-Amazon Scrub Lint
     runs-on: ubuntu-latest
@@ -463,7 +535,7 @@ jobs:
     name: Coverage Gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [coverage-combine, frontend-test]
+    needs: [coverage-combine, frontend-test, changes]
     # Always run so the required check emits a real verdict. Without
     # `if: always()`, a failing OR skipped dependency would SKIP this job, and
     # GitHub treats a skipped required check as SATISFIED -- silently defeating
@@ -472,14 +544,33 @@ jobs:
     # non-success upstream result into an explicit failure.
     if: ${{ always() }}
     steps:
-      - name: Require upstream coverage jobs to have succeeded
+      - name: Require upstream coverage jobs to have succeeded (frontend may be path-skipped)
         env:
           CC: ${{ needs.coverage-combine.result }}
           FE: ${{ needs.frontend-test.result }}
+          RUN_FRONTEND: ${{ needs.changes.outputs.run_frontend }}
         run: |
-          echo "coverage-combine=$CC  frontend-test=$FE"
-          if [ "$CC" != "success" ] || [ "$FE" != "success" ]; then
-            echo "::error::Upstream coverage jobs did not succeed (coverage-combine=$CC, frontend-test=$FE) -- failing closed."
+          echo "coverage-combine=$CC  frontend-test=$FE  run_frontend=$RUN_FRONTEND"
+          # Empty flag = the path-filter (changes) job never reported -- its
+          # skips can't be trusted, so fail closed.
+          if [ -z "$RUN_FRONTEND" ]; then
+            echo "::error::path-filter (changes) never reported -- failing closed."
+            exit 1
+          fi
+          # Backend coverage is ALWAYS required (backend jobs are ungated).
+          if [ "$CC" != "success" ]; then
+            echo "::error::coverage-combine=$CC -- failing closed."
+            exit 1
+          fi
+          # Frontend: required to succeed when the frontend surface ran; must be
+          # exactly 'skipped' when it was path-skipped. Any other state
+          # (failure, cancellation, dependency-skip) fails closed.
+          if [ "$RUN_FRONTEND" = "true" ] && [ "$FE" != "success" ]; then
+            echo "::error::frontend-test=$FE but frontend was required -- failing closed."
+            exit 1
+          fi
+          if [ "$RUN_FRONTEND" != "true" ] && [ "$FE" != "skipped" ]; then
+            echo "::error::frontend-test=$FE but frontend was path-skipped -- inconsistent, failing closed."
             exit 1
           fi
 
@@ -490,6 +581,7 @@ jobs:
           path: backend-cov
 
       - name: Download frontend coverage
+        if: needs.frontend-test.result == 'success'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: coverage-frontend
@@ -512,6 +604,7 @@ jobs:
           PY
 
       - name: Check frontend coverage (min 60%)
+        if: needs.frontend-test.result == 'success'
         run: |
           F=$(find frontend-cov -name 'cobertura*.xml' 2>/dev/null | head -1)
           test -n "$F" || { echo "::error::cobertura report missing from coverage-frontend artifact"; exit 1; }
@@ -544,6 +637,8 @@ jobs:
 
   frontend-lint:
     name: Frontend Lint & Type Check
+    needs: [changes]
+    if: needs.changes.outputs.run_frontend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -688,6 +783,8 @@ jobs:
   # pure unit tests, no Electron binary download, no packaging.
   electron-test:
     name: Electron Shell Tests
+    needs: [changes]
+    if: needs.changes.outputs.run_frontend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -717,6 +814,8 @@ jobs:
 
   frontend-test:
     name: Frontend Tests
+    needs: [changes]
+    if: needs.changes.outputs.run_frontend == 'true'
     runs-on: ubuntu-latest
     # vitest + coverage is the longest ubuntu job (~23 min observed max).
     timeout-minutes: 50
