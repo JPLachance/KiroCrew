@@ -5253,6 +5253,369 @@ class TestOrchestratorPlanGateArming:
             "no phantom stage beyond the live plan size may be built"
         )
 
+    # ── P0 hardening: recovery watchdog, turn timeout, subagent wait cap ──
+
+    @staticmethod
+    def _orch_state():
+        """Minimal DashboardState double for driving _stage_loop."""
+        state = MagicMock()
+        state.broadcast_ws = MagicMock()
+        state.push_slots_update = MagicMock()
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for = MagicMock(return_value=[])
+        return state
+
+    @staticmethod
+    def _nudge_svc(existing=None):
+        """AutoNudgeService double. ``existing`` is what the slot already had."""
+        svc = MagicMock()
+        svc.remove = AsyncMock()
+        svc.get_by_slot = MagicMock(return_value=existing)
+        return svc
+
+    @staticmethod
+    def _patch_authz(monkeypatch, error=None):
+        """Stub the audited arming chokepoint and return the recording mock.
+
+        Production arms through ``authorize_and_add_nudge`` (SEL-audited, does
+        ownership checks) rather than ``svc.add``, so that is what is asserted.
+        """
+        authz = AsyncMock(
+            return_value=(None if error else MagicMock(id="loop-1"), error, 200)
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_orchestrator.authorize_and_add_nudge", authz
+        )
+        return authz
+
+    @pytest.mark.asyncio
+    async def test_stage_loop_arms_no_watchdog_on_clean_completion(
+        self, tmp_path, monkeypatch
+    ):
+        """A run that completes every stage arms NOTHING. The watchdog is armed
+        only after an abnormal exit, so a finished plan leaves no timer that
+        could nudge an idle session about work that actually succeeded."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        nudge = self._nudge_svc()
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_orchestrator._autonudge_get", lambda: nudge
+        )
+        authz = self._patch_authz(monkeypatch)
+
+        state = self._orch_state()
+        slot = _ChatSlot("nudge-clean", mode="orchestrator")
+        slot._stage_titles = ["A"]
+        slot._orch_tracker = None
+
+        async def _ok(s, sl, msg, **kw):
+            return None
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _ok)
+
+        await _stage_loop(state, slot, auto_run=True)
+
+        authz.assert_not_awaited()
+        nudge.remove.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stage_loop_arms_watchdog_when_a_stage_errors(
+        self, tmp_path, monkeypatch
+    ):
+        """THE point of the watchdog: a stage that blows up must arm a nudge, so
+        the plan cannot die silently in an idle session."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        nudge = self._nudge_svc()
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_orchestrator._autonudge_get", lambda: nudge
+        )
+        authz = self._patch_authz(monkeypatch)
+
+        state = self._orch_state()
+        slot = _ChatSlot("nudge-error", mode="orchestrator")
+        slot._stage_titles = ["A", "B"]
+        slot._orch_tracker = None
+
+        async def _boom(s, sl, msg, **kw):
+            raise RuntimeError("stage exploded")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _boom)
+
+        await _stage_loop(state, slot, auto_run=True)
+
+        authz.assert_awaited_once()
+        kw = authz.await_args.kwargs
+        assert kw["source"] == "orchestrator", (
+            "arming must be attributed to the orchestrator in the SEL audit"
+        )
+        assert kw["max_cycles"] == 1, "the watchdog is one-shot"
+
+    @pytest.mark.asyncio
+    async def test_stage_loop_never_clobbers_a_user_armed_monitor(
+        self, tmp_path, monkeypatch
+    ):
+        """AutoNudge keeps one loop per slot and arming REPLACES it, so arming a
+        watchdog on a slot that already has a monitor_start loop would destroy
+        the user's persisted monitor. Stand down instead -- their loop already
+        wakes the session on idle, which is what recovery needs."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        nudge = self._nudge_svc(
+            existing=MagicMock(
+                id="user-monitor", active=True, max_cycles=0, cycle_count=2
+            )
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_orchestrator._autonudge_get", lambda: nudge
+        )
+        authz = self._patch_authz(monkeypatch)
+
+        state = self._orch_state()
+        slot = _ChatSlot("nudge-existing", mode="orchestrator")
+        slot._stage_titles = ["A", "B"]
+        slot._orch_tracker = None
+
+        async def _boom(s, sl, msg, **kw):
+            raise RuntimeError("stage exploded")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _boom)
+
+        await _stage_loop(state, slot, auto_run=True)
+
+        authz.assert_not_awaited()
+        nudge.remove.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stage_loop_takes_over_a_spent_watchdog(
+        self, tmp_path, monkeypatch
+    ):
+        """AutoNudge DEACTIVATES a capped loop instead of removing it, and
+        get_by_slot applies no active filter -- so a slot can hold a permanently
+        dead loop. Since the watchdog is itself max_cycles=1, treating "a loop
+        exists" as "recovery is covered" would arm it exactly once per slot per
+        gateway lifetime and leave every later plan unwatched."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        spent = MagicMock(id="spent", active=False, max_cycles=1, cycle_count=1)
+        nudge = self._nudge_svc(existing=spent)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_orchestrator._autonudge_get", lambda: nudge
+        )
+        authz = self._patch_authz(monkeypatch)
+
+        state = self._orch_state()
+        slot = _ChatSlot("nudge-spent", mode="orchestrator")
+        slot._stage_titles = ["A", "B"]
+        slot._orch_tracker = None
+
+        async def _boom(s, sl, msg, **kw):
+            raise RuntimeError("stage exploded")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _boom)
+
+        await _stage_loop(state, slot, auto_run=True)
+
+        authz.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stage_loop_leaves_a_user_paused_monitor_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """A monitor the user PAUSED is also inactive, but it is not spent.
+        Arming over it would destroy their configuration and resurrect firing
+        they deliberately silenced, so `active` alone is the wrong test -- the
+        cycle cap is what separates spent from paused."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        paused = MagicMock(id="paused", active=False, max_cycles=0, cycle_count=7)
+        nudge = self._nudge_svc(existing=paused)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_orchestrator._autonudge_get", lambda: nudge
+        )
+        authz = self._patch_authz(monkeypatch)
+
+        state = self._orch_state()
+        slot = _ChatSlot("nudge-paused", mode="orchestrator")
+        slot._stage_titles = ["A", "B"]
+        slot._orch_tracker = None
+
+        async def _boom(s, sl, msg, **kw):
+            raise RuntimeError("stage exploded")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _boom)
+
+        await _stage_loop(state, slot, auto_run=True)
+
+        authz.assert_not_awaited()
+
+    def test_is_spent_nudge_classifies_each_lifecycle_state(self):
+        """Unit-level truth table for the three states that reach the check."""
+        from kiro_crew.dashboard.chat_orchestrator import _is_spent_nudge
+
+        # Active -> will fire, recovery already covered.
+        assert not _is_spent_nudge(
+            MagicMock(active=True, max_cycles=1, cycle_count=0)
+        )
+        # Active and uncapped (a running monitor_start loop).
+        assert not _is_spent_nudge(
+            MagicMock(active=True, max_cycles=0, cycle_count=99)
+        )
+        # Inactive but uncapped -> user pressed pause, NOT spent.
+        assert not _is_spent_nudge(
+            MagicMock(active=False, max_cycles=0, cycle_count=3)
+        )
+        # Inactive and capped out -> spent, safe to take over.
+        assert _is_spent_nudge(MagicMock(active=False, max_cycles=1, cycle_count=1))
+        assert _is_spent_nudge(MagicMock(active=False, max_cycles=5, cycle_count=9))
+
+    @pytest.mark.asyncio
+    async def test_stage_loop_survives_a_denied_watchdog_arm(
+        self, tmp_path, monkeypatch
+    ):
+        """The authz chokepoint returns an error rather than raising. A watchdog
+        that cannot be armed must not mask the real stage failure."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        nudge = self._nudge_svc()
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_orchestrator._autonudge_get", lambda: nudge
+        )
+        self._patch_authz(monkeypatch, error="slot not found")
+
+        state = self._orch_state()
+        slot = _ChatSlot("nudge-denied", mode="orchestrator")
+        slot._stage_titles = ["A", "B"]
+        slot._orch_tracker = None
+
+        async def _boom(s, sl, msg, **kw):
+            raise RuntimeError("stage exploded")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _boom)
+
+        await _stage_loop(state, slot, auto_run=True)
+
+        assert any(
+            "failed due to an internal error" in m.get("content", "")
+            for m in slot.messages
+        ), "the real stage failure must still be reported to the user"
+
+    @pytest.mark.asyncio
+    async def test_stage_loop_times_out_a_stage_that_swallows_cancellation(
+        self, tmp_path, monkeypatch
+    ):
+        """The real `_run_chat` CATCHES CancelledError (flushes partial output and
+        returns), so `asyncio.wait_for` would absorb its own deadline and let a
+        half-finished stage advance as a success. The fake here reproduces that
+        exact semantic -- a bare `sleep()` would propagate the cancellation and
+        pass even against the broken implementation, which is why this test uses
+        a swallowing turn."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
+        from kiro_crew.context_management import OrchestrationTracker
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        state = self._orch_state()
+        slot = _ChatSlot("hang-test", mode="orchestrator")
+        slot._stage_titles = ["A", "B"]
+        # 1s budget so the ceiling fires well inside the test's runtime.
+        slot._orch_tracker = OrchestrationTracker(stage_timeout_seconds=1)
+        slot._auto_run = True
+
+        swallowed = False
+
+        async def _hang_and_swallow(s, sl, msg, **kw):
+            nonlocal swallowed
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                # Exactly what _run_chat does: absorb it and return normally.
+                swallowed = True
+                return None
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_orchestrator._run_chat", _hang_and_swallow
+        )
+
+        await asyncio.wait_for(_stage_loop(state, slot, auto_run=True), timeout=30)
+
+        assert swallowed, "the fake must have absorbed the cancellation (the real path)"
+        assert slot._auto_run is False, "a stage cut at the ceiling must stop auto-run"
+        assert any(
+            "timed out" in m.get("content", "") for m in slot.messages
+        ), "the user must see a timeout card, not a silently-advanced stage"
+        seps = [m["content"] for m in slot.messages if "stage-sep" in m.get("cls", "")]
+        assert not any("Stage 2" in s for s in seps), (
+            "a cut stage must NOT advance to the next one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage_loop_disabled_timeout_does_not_abort_instantly(
+        self, tmp_path, monkeypatch
+    ):
+        """stage_timeout_seconds=0 means 'disabled' (see is_stage_timed_out), so
+        it must become wait_for(None) — passing 0 through would time out every
+        stage before its turn began."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
+        from kiro_crew.context_management import OrchestrationTracker
+        from kiro_crew.dashboard.chat import _stage_loop
+
+        state = self._orch_state()
+        slot = _ChatSlot("no-timeout", mode="orchestrator")
+        slot._stage_titles = ["A"]
+        slot._orch_tracker = OrchestrationTracker(stage_timeout_seconds=0)
+
+        ran = 0
+
+        async def _ok(s, sl, msg, **kw):
+            nonlocal ran
+            ran += 1
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _ok)
+
+        await _stage_loop(state, slot, auto_run=True)
+
+        assert ran == 1, "a disabled timeout must let the stage turn actually run"
+        assert not any(
+            "timed out" in m.get("content", "") for m in slot.messages
+        ), "no timeout card may be emitted when the timeout is disabled"
+
+    def test_subagent_wait_cap_scales_with_stage_timeout(self):
+        """The poll cap tracks the stage budget instead of a fixed 5 min, and a
+        disabled timeout falls back to the ceiling rather than 0 (which would
+        skip the subagent wait entirely)."""
+        from kiro_crew.context_management import OrchestrationTracker
+
+        def cap(timeout: int) -> int:
+            t = OrchestrationTracker(stage_timeout_seconds=timeout)
+            return min(t.stage_timeout_seconds // 4, 450) if t.stage_timeout_seconds else 450
+
+        assert cap(1800) == 450, "default 30m budget -> 15 min of subagent wait"
+        assert cap(600) == 150, "a 10m budget scales down proportionally"
+        assert cap(7200) == 450, "a huge budget is still capped at the 15 min ceiling"
+        assert cap(0) == 450, "disabled timeout must NOT collapse the wait to zero"
+
 
 # ── Tests: plan execution via Go/Go All button simulation ──
 

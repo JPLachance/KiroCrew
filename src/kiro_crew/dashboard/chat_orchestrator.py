@@ -10,15 +10,43 @@ from pathlib import Path
 
 from aiohttp import web
 
+from kiro_crew.autonudge import NudgeLoop
+from kiro_crew.autonudge import get_instance as _autonudge_get
+from kiro_crew.autonudge_authz import authorize_and_add_nudge
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.context_management import OrchestrationTracker
 from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.dashboard.turn_dispatch import _bounded_turn
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import SecurityEvent, sel
 
 logger = logging.getLogger(__name__)
+
+
+def _is_spent_nudge(loop: NudgeLoop) -> bool:
+    """True when *loop* has run out its cycle cap and can never fire again.
+
+    AutoNudge does NOT remove a loop that reaches ``max_cycles`` -- it calls
+    ``update(active=False)`` and leaves the record in the store, and
+    ``get_by_slot`` applies no ``active`` filter. So a slot can hold a loop that
+    is permanently dead, and treating "a loop exists" as "recovery is covered"
+    would silently suppress the watchdog. That case is self-inflicted: the
+    watchdog itself is ``max_cycles=1``, so without this check it would arm
+    exactly once per slot per gateway lifetime and every later plan would go
+    unwatched.
+
+    ``active`` alone is the wrong test, because a monitor the USER paused is also
+    inactive -- replacing that would destroy their configuration and resurrect
+    firing they deliberately silenced. The cap is the discriminator that
+    distinguishes the two, and unlike the loop's origin it is persisted state.
+    """
+    if loop.active:
+        return False  # still live -- it will fire, so recovery is covered
+    if loop.max_cycles <= 0:
+        return False  # uncapped and inactive => user-paused, not spent
+    return loop.cycle_count >= loop.max_cycles
 
 
 def _build_stage_context(
@@ -169,6 +197,13 @@ async def _stage_loop(
 
     _paused = False
     _cancelled = False
+    # Watchdog arming: the recovery nudge is disarmed ONLY on a genuinely clean
+    # exit (user stop, pause-for-Go, full completion, user cancel). Every other
+    # exit — stage timeout, _run_chat error, subagent wait exhaustion, a
+    # fail-closed subagent check — LEAVES IT ARMED so it fires and the model can
+    # report what broke. Defaulting to False is what makes the watchdog useful:
+    # a new abnormal-exit path added later stays covered without touching this.
+    _clean_exit = False
     # Mark the ENTIRE stage-execution lifetime, not each _run_chat call. A
     # stage turn can queue a recovery/continue turn (empty-response re-queue,
     # stale/tool-stall recovery) that runs slightly later on the same slot; a
@@ -186,6 +221,7 @@ async def _stage_loop(
     try:
         for stage_idx in range(start_idx, total):
             if slot._stopping:
+                _clean_exit = True  # user stop — not a crash
                 break
 
             stage_num = stage_idx + 1  # 1-based for display
@@ -266,7 +302,56 @@ async def _stage_loop(
             )
             slot.append("user", context, "msg msg-u auto-go")
             try:
-                await _run_chat(state, slot, context)
+                # `_bounded_turn`, NOT `asyncio.wait_for`. `_run_chat` CATCHES
+                # CancelledError (it flushes the partial assistant output and
+                # returns), so wait_for would absorb its own deadline: the inner
+                # task completes "normally", wait_for hands back a value instead
+                # of raising, and a half-finished stage would advance as if it
+                # had succeeded. `_bounded_turn` records that its own timer
+                # fired and raises on that observed fact, so a swallowed
+                # cancellation still surfaces. See its docstring in
+                # turn_dispatch.py -- it exists for exactly this trap.
+                #
+                # A falsy stage_timeout_seconds means "disabled" everywhere else
+                # in the tracker, so skip the ceiling entirely rather than
+                # passing 0, which would cut every stage instantly.
+                _turn_timeout = tracker.stage_timeout_seconds
+                if _turn_timeout:
+                    await _bounded_turn(_run_chat(state, slot, context), _turn_timeout)
+                else:
+                    await _run_chat(state, slot, context)
+            except (asyncio.TimeoutError, TimeoutError):
+                # `_bounded_turn` raises builtin TimeoutError; on 3.10
+                # asyncio.TimeoutError is a DIFFERENT class, so catch both (the
+                # convention already used by _run_pending_synthesis).
+                logger.error(
+                    "Stage %d exceeded its %ds ceiling for slot %s",
+                    stage_num, tracker.stage_timeout_seconds, slot.key,
+                )
+                _timeout_msg = (
+                    f"⏱️ Stage {stage_num} timed out after {tracker.timeout_human}. "
+                    "Auto-run stopped."
+                )
+                slot._auto_run = False
+                slot.append("assistant", _timeout_msg, "msg msg-a")
+                state.broadcast_ws(
+                    "chat_append",
+                    {"slot": slot.key, "html": _timeout_msg, "cls": "msg msg-a"},
+                )
+                sel().log(
+                    SecurityEvent(
+                        event_id=uuid.uuid4().hex,
+                        timestamp=datetime.now(tz=timezone.utc).isoformat(),
+                        event_type="auto_run_timeout",
+                        caller_identity=f"dashboard:{slot.key}",
+                        agent=getattr(slot, "agent", ""),
+                        source="dashboard",
+                        operation="stage_turn_ceiling",
+                        outcome="stopped",
+                        resources=f"slot={slot.key},stage={stage_num}",
+                    )
+                )
+                break
             except Exception:
                 logger.exception("_run_chat failed during stage %d for slot %s", stage_num, slot.key)
                 _err_msg = f"❌ Stage {stage_num} failed due to an internal error. Auto-run stopped."
@@ -296,6 +381,19 @@ async def _stage_loop(
 
             # Wait for pending subagents spawned during this stage
             _sa_rounds = 0
+            # Dynamic poll cap. Each poll sleeps 2s, so `stage_timeout // 4`
+            # rounds ≈ half the stage timeout in wall-clock, hard-capped at 450
+            # rounds (15 min). This replaces a fixed 150 (5 min), which was far
+            # shorter than a subagent's own 30-min budget and abandoned
+            # legitimate long-running analysis agents mid-flight.
+            # A falsy stage timeout means "disabled", so fall back to the 15-min
+            # ceiling rather than 0 (which would skip the wait entirely).
+            # Worst case per stage is therefore turn-timeout + subagent-wait;
+            # the total-plan watchdog (separate follow-up) bounds the run.
+            if tracker.stage_timeout_seconds:
+                _sa_max_rounds = min(tracker.stage_timeout_seconds // 4, 450)
+            else:
+                _sa_max_rounds = 450
             session_key = f"dashboard:{slot.key}"
             if state.subagents is None:
                 # Fail-closed: subagent manager missing — stop auto-run
@@ -369,7 +467,7 @@ async def _stage_loop(
                 )
                 while (
                     _pending
-                    and _sa_rounds < 150
+                    and _sa_rounds < _sa_max_rounds
                     and not slot._stopping
                 ):
                     _sa_rounds += 1
@@ -414,14 +512,16 @@ async def _stage_loop(
                     )
                 )
                 break
-            if _sa_rounds >= 150:
+            if _sa_rounds >= _sa_max_rounds:
+                _wait_secs = _sa_rounds * 2
                 logger.warning(
-                    "Stage %d: subagent wait exhausted after %ds for slot %s",
-                    stage_num, _sa_rounds * 2, slot.key,
+                    "Stage %d: subagent wait exhausted after %ds (%d rounds, cap %d) for slot %s",
+                    stage_num, _wait_secs, _sa_rounds, _sa_max_rounds, slot.key,
                 )
                 slot._auto_run = False
                 _sa_msg = (
-                    f"⚠️ Stage {stage_num}: subagent wait exhausted after 5 minutes. "
+                    f"⚠️ Stage {stage_num}: subagent wait exhausted after "
+                    f"{_wait_secs // 60} minutes. "
                     "Auto-run stopped — some results may be incomplete."
                 )
                 slot.append("assistant", _sa_msg, "msg msg-a")
@@ -472,9 +572,11 @@ async def _stage_loop(
                         {"slot": slot.key, "role": "assistant", "content": done_msg},
                     )
                     _paused = True
+                    _clean_exit = True  # paused for the user's next Go click
                     return  # User's next "Go" click will re-enter _stage_loop
         else:
             # for loop completed without break — all stages done
+            _clean_exit = True  # every stage ran; nothing to recover
             if not slot._stopping and start_idx < total:
                 slot._auto_run = False
                 # Build execution summary from captured stage results
@@ -525,8 +627,83 @@ async def _stage_loop(
         # is being torn down and a started turn would run orphaned). Mark it and
         # re-raise so the task ends cancelled.
         _cancelled = True
+        _clean_exit = True  # deliberate teardown, not a silent crash
         raise
     finally:
+        # Arm the recovery watchdog ONLY on an abnormal exit -- stage ceiling,
+        # `_run_chat` error, subagent wait exhaustion, a fail-closed subagent
+        # check. `_clean_exit` defaults to False, so a future abnormal-exit path
+        # is covered without touching this block.
+        #
+        # Arming HERE, not at loop entry, is load-bearing. `slot.running` is NOT
+        # a reliable "plan in progress" signal: each stage's `_run_chat` closes
+        # its own turn (`slot.task = None`) between stages, so `slot.running`
+        # reads False mid-plan -- the reason `_in_stage_execution` exists as a
+        # separate flag at all. Since `_fire_dashboard_nudge` gates only on
+        # `slot.running`, a timer armed at entry could fire DURING the plan
+        # (notably across the multi-minute subagent poll below) and inject a
+        # spurious "the loop exited" turn whose output would land in the stage
+        # result. Arming after the loop has actually exited makes that
+        # structurally impossible, and collapses the check-then-add race against
+        # a user's own monitor to a single uninterrupted step.
+        #
+        # Routed through `authorize_and_add_nudge`, the SINGLE SEL-audited
+        # enforcement point shared with the REST handler and the monitor_start
+        # directive -- never `svc.add` directly, which would arm a self-firing
+        # unattended turn with no audit trail (backend-security-controls).
+        if not _clean_exit:
+            try:
+                _nudge_svc = _autonudge_get()
+                _live = None if _nudge_svc is None else _nudge_svc.get_by_slot(slot.key)
+                if _nudge_svc is None:
+                    pass
+                elif _live is not None and not _is_spent_nudge(_live):
+                    # AutoNudge keeps one loop per slot and arming REPLACES it.
+                    # Stand down for any loop that is still meaningful: an ACTIVE
+                    # one already wakes the session on idle (which is what
+                    # recovery needs), and an inactive-but-uncapped one was
+                    # PAUSED by the user -- replacing that would both destroy
+                    # their config and resurrect firing they deliberately
+                    # silenced. Only a spent loop is safe to take over.
+                    logger.info(
+                        "Stage loop exited abnormally for slot %s but a live nudge"
+                        " loop is already armed there (active=%s); leaving it alone",
+                        slot.key, getattr(_live, "active", None),
+                    )
+                else:
+                    _nudge_msg = (
+                        "Orchestration watchdog: the autopilot plan stopped before "
+                        "finishing. Report which stage was running and why it "
+                        "stopped -- the stage result files in this session's "
+                        "directory record what completed. Call autonudge_stop "
+                        "when you have reported."
+                    )
+                    _nudge_loop, _nudge_err, _ = await authorize_and_add_nudge(
+                        svc=_nudge_svc,
+                        state=state,
+                        slot_key=slot.key,
+                        message=_nudge_msg,
+                        idle_secs=120,
+                        max_cycles=1,  # one-shot
+                        stop_sentinel_path="",
+                        source="orchestrator",
+                        caller="stage-loop-watchdog",
+                    )
+                    if _nudge_err is not None:
+                        # Returns the reason rather than raising. A watchdog we
+                        # could not arm must not mask the real failure.
+                        logger.warning(
+                            "Stage loop could not arm a recovery nudge for slot"
+                            " %s: %s", slot.key, _nudge_err,
+                        )
+                    else:
+                        logger.info(
+                            "Stage loop armed recovery nudge %s for slot %s after"
+                            " an abnormal exit",
+                            getattr(_nudge_loop, "id", None), slot.key,
+                        )
+            except Exception:
+                logger.debug("Could not arm recovery nudge", exc_info=True)
         # Clear the stage-execution guard exactly once, when the loop exits
         # (pause / completion / break / error). This spans any queued recovery
         # turns a stage started, and lets a later Cancel + re-plan arm again.
