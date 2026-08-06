@@ -125,6 +125,7 @@ import {
   adoptSourceSelections,
   commitSourceSelection,
   isSourceSelectionKey,
+  LOCAL_CHANGES_SOURCE_URL,
   loadSeenPullRequestLinks,
   loadSourceSelections,
   partitionSourceLinks,

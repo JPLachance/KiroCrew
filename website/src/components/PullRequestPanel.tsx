@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Circle,
   ExternalLink,
+  FolderGit2,
   GitCommitHorizontal,
   GitMerge,
   GitPullRequest,
@@ -29,6 +30,7 @@ import type {
   PullRequestStatusBatch,
 } from '../types'
 import {
+  LOCAL_CHANGES_SOURCE_URL,
   MAX_PULL_REQUEST_SOURCES,
   type PullRequestLink,
 } from '../utils/pullRequestLinks'
@@ -38,6 +40,7 @@ import hljs from '../utils/hljs'
 import DOMPurify from 'dompurify'
 import { DIFF_BG, DIFF_NUM, DIFF_EDGE } from '../utils/diffUtils'
 import UnchangedSeparator from './UnchangedSeparator'
+import LocalChangesView from './LocalChangesView'
 import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
 import { timeAgo } from '../utils/timeAgo'
@@ -795,6 +798,8 @@ export default function PullRequestPanel({
   onSelect,
   onReconcile,
   onAddToChat,
+  projectDir,
+  onFileOpen,
 }: {
   sources: PullRequestLink[]
   selectedUrl: string
@@ -806,9 +811,18 @@ export default function PullRequestPanel({
   // still being refetched. Defaults to onSelect for callers that do not care.
   onReconcile?: (url: string) => void
   onAddToChat: (text: string) => void
+  /** Chat's project directory — scopes the ever-present Local tab. */
+  projectDir?: string
+  /** Open a path as a native file document tab (Local tab file names). */
+  onFileOpen?: (path: string) => void
 }) {
   const cappedSources = sources.slice(0, MAX_PULL_REQUEST_SOURCES)
-  const selected = cappedSources.find(source => source.url === selectedUrl) || cappedSources[0]
+  // The Local Changes tab is ever-present in the source strip, selected via a
+  // sentinel "url"; it is also the default whenever there are no PR sources.
+  const localSelected = selectedUrl === LOCAL_CHANGES_SOURCE_URL || cappedSources.length === 0
+  const selected = localSelected
+    ? undefined
+    : cappedSources.find(source => source.url === selectedUrl) || cappedSources[0]
   const [tab, setTab] = useState<SourceTab>('changes')
   const [checkPollState, setCheckPollState] = useState({ url: '', failures: 0 })
   const checkPollStateRef = useRef({ url: '', failures: 0 })
@@ -1019,6 +1033,17 @@ export default function PullRequestPanel({
   return (
     <div className="flex flex-col h-full min-h-0">
       <div role="tablist" aria-label={i18nT('components.pullRequestPanel.pull_requests')} className="shrink-0 border-b border-border px-2 py-2 flex items-center gap-1 overflow-x-auto">
+        <Btn
+          type="button"
+          role="tab"
+          aria-selected={localSelected}
+          onClick={() => onSelect(LOCAL_CHANGES_SOURCE_URL)}
+          className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border-none cursor-pointer text-[12px] transition-colors ${localSelected ? 'bg-bg-hover text-text' : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover/60'}`}
+          title={projectDir || 'Local working-tree changes'}
+        >
+          <FolderGit2 size={13} className="shrink-0" />
+          <span>Local</span>
+        </Btn>
         {cappedSources.map(item => (
           <Btn
             key={item.url}
@@ -1036,8 +1061,14 @@ export default function PullRequestPanel({
         ))}
       </div>
 
-      {query.isLoading && <div className="flex-1 flex items-center justify-center gap-2 text-[13px] text-muted"><Loader className="lucide-inline animate-spin" />{i18nT('components.pullRequestPanel.loading_source_provider')}</div>}
-      {query.error && (
+      {localSelected && (
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <LocalChangesView projectDir={projectDir} onFileOpen={onFileOpen} />
+        </div>
+      )}
+
+      {!localSelected && query.isLoading && <div className="flex-1 flex items-center justify-center gap-2 text-[13px] text-muted"><Loader className="lucide-inline animate-spin" />{i18nT('components.pullRequestPanel.loading_source_provider')}</div>}
+      {!localSelected && query.error && (
         <div className="flex-1 flex items-center justify-center px-6">
           <div role="alert" className="max-w-md flex flex-col items-center">
             <AlertCircle className={`lucide-inline mb-2 ${queryError.loginCommand ? 'text-warn' : 'text-danger'}`} />

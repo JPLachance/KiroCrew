@@ -744,7 +744,7 @@ function FileRow({ f, onFileOpen, onFileRemove, artifactSlug, promotable, onProm
     queryFn: () => api.fileDiff(f.path),
     placeholderData: (prev) => prev,
   })
-  const stats = data?.diff ? countDiffStats(data.diff) : null
+  const stats = data?.diff && !data.diff_truncated ? countDiffStats(data.diff) : null
   // Artifact control, three mutually exclusive states:
   //   • already in the library → an always-visible accent glyph that OPENS it
   //     (never a second save — the row is the entry point for both)
@@ -787,6 +787,12 @@ function FileRow({ f, onFileOpen, onFileRemove, artifactSlug, promotable, onProm
         <span className="text-[12.5px] text-text truncate">{name}</span>
         {dir && <span className="text-[10.5px] text-muted/80 truncate">{dir}</span>}
       </span>
+      <span className="truncate text-text max-w-[140px]">{name}</span>
+      {data?.diff_truncated && (
+        <span className="text-[10px] font-mono text-warn shrink-0 ml-0.5" title="Line totals unavailable because the diff was truncated">
+          partial
+        </span>
+      )}
       {stats && (stats.added > 0 || stats.removed > 0) && (
         <span className="flex items-center gap-1.5 text-[11px] font-mono shrink-0 tabular-nums">
           {stats.added > 0 && <span className="text-ok">+{stats.added}</span>}
@@ -1173,7 +1179,7 @@ function ArtifactListRow({ row, busy, onOpen, onSave }: {
   )
 }
 
-export default function ActivityViewer({ subagents, toolLog, open, onToggle, slot, files, onFileOpen, onFolderOpen, onArtifactOpen, onFileRemove, navLinks, navResolving, view, sources, selectedSourceUrl, onSelectSource, onReconcileSource, issues, selectedIssueUrl, onSelectIssue, onReconcileIssue, onAddToChat, onFileSave, onSubmitComments, openDocPaths, previewPath, onPreviewPathChange }: {
+export default function ActivityViewer({ subagents, toolLog, open, onToggle, slot, files, onFileOpen, onFolderOpen, onArtifactOpen, onFileRemove, navLinks, navResolving, view, sources, projectDir, selectedSourceUrl, onSelectSource, onReconcileSource, issues, selectedIssueUrl, onSelectIssue, onReconcileIssue, onAddToChat, onFileSave, onSubmitComments, openDocPaths, previewPath, onPreviewPathChange }: {
   subagents: Record<string, SubagentActivity>; toolLog: ToolActivity[]; open: boolean; onToggle: () => void; slot: string
   files?: TouchedFile[]; onFileOpen?: (path: string) => void; onFolderOpen?: (p: string) => void; onArtifactOpen?: (slug: string) => void; onFileRemove?: (path: string) => void; onFilesClear?: (source: 'history' | 'tool') => void
   projectDir?: string
@@ -1341,7 +1347,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
   const effectiveTab = requestedTab === 'changes' && !hasSources && !view ? 'files' : requestedTab
 
   const TABS: { key: typeof tab; label: string; icon: ReactNode; count?: number }[] = [
-    ...(hasSources ? [{ key: 'changes' as const, label: i18nT('pages.chat.activityViewer.changes'), icon: <GitPullRequest size={13} />, count: sources!.length }] : []),
+    ...([{ key: 'changes' as const, label: i18nT('pages.chat.activityViewer.changes'), icon: <GitPullRequest size={13} />, count: sources!.length }] : []),
     ...(hasIssues ? [{ key: 'issues' as const, label: i18nT('pages.chat.activityViewer.issues'), icon: <CircleDot size={13} />, count: issues!.length }] : []),
     { key: 'files', label: i18nT('pages.chat.activityViewer.files'), icon: <FileText size={13} />, count: files?.length || 0 },
     { key: 'artifacts', label: i18nT('pages.chat.activityViewer.artifacts'), icon: <Component size={13} /> },
@@ -1369,22 +1375,18 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
         </div>
       )}
 
-      {/* Changes (pull request sources) view */}
+      {/* Changes view: ever-present Local worktree tab + pull request sources */}
       {effectiveTab === 'changes' && (
         <div className="flex-1 min-h-0 overflow-hidden">
-          {hasSources ? (
-            <PullRequestPanel
-              sources={sources!}
-              selectedUrl={selectedSourceUrl || ''}
-              onSelect={onSelectSource || (() => {})}
-              onReconcile={onReconcileSource}
-              onAddToChat={onAddToChat || (() => {})}
-            />
-          ) : (
-            <div className="text-muted text-[13px] pt-8 px-6 text-center">
-              {i18nT('pages.chat.activityViewer.no_pull_requests_yet')}
-            </div>
-          )}
+          <PullRequestPanel
+            sources={sources || []}
+            projectDir={projectDir}
+            selectedUrl={selectedSourceUrl || ''}
+            onSelect={onSelectSource || (() => {})}
+            onReconcile={onReconcileSource}
+            onFileOpen={onFileOpen}
+            onAddToChat={onAddToChat || (() => {})}
+          />
         </div>
       )}
 
